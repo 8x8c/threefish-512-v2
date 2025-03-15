@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Threefish-512 App (Version 2) - README</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      line-height: 1.5;
+      margin: 20px;
+      max-width: 900px;
+    }
+    pre {
+      background: #f7f7f7;
+      border: 1px solid #ccc;
+      padding: 10px;
+      overflow: auto;
+    }
+    code {
+      font-family: Consolas, monospace;
+      font-size: 0.9em;
+    }
+    h1, h2, h3 {
+      margin-top: 1em;
+      margin-bottom: 0.5em;
+    }
+    .section {
+      margin-bottom: 2em;
+    }
+    ul {
+      margin-bottom: 0.8em;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Threefish-512 App (Version 2) - README</h1>
+
+<p>
+This document describes the <strong>Version 2</strong> of a Threefish-512 encryption/decryption command-line application. It explains what changed from Version 1, how the encryption scheme works in detail, and provides the complete (compilable) Rust source code.
+</p>
+
+<hr>
+
+<div class="section">
+  <h2>What Changed from Version 1?</h2>
+  <p>
+    In Version 1, we had a Threefish-512 tool that:
+  </p>
+  <ul>
+    <li>Derived a 128-byte key using Argon2 (hard-coded parameters)</li>
+    <li>Used Threefish-512 in a CTR-like mode for encryption</li>
+    <li>Applied HMAC-SHA512 for message authentication (encrypt-then-HMAC)</li>
+    <li>Stored a 16-byte salt and 16-byte nonce plus ciphertext and HMAC in a simple file layout</li>
+  </ul>
+
+  <p>
+    <strong>Version 2</strong> introduces improvements:
+  </p>
+  <ol>
+    <li>
+      <strong>Versioned File Header and Embedded Argon2 Parameters</strong><br>
+      Instead of hardcoding Argon2 settings (memory cost, passes, etc.), we now store them in the file header alongside a version number. That means if we ever change these parameters, we can still decrypt older files correctly by reading the parameters from the file.
+    </li>
+    <li>
+      <strong>Zeroing Out Sensitive Data</strong><br>
+      We use the <code>zeroize</code> crate to securely clear the derived keys from memory once we finish encrypting or decrypting. This reduces the window in which an attacker (with memory forensics) could discover the key.
+    </li>
+    <li>
+      <strong>Same Threefish + HMAC Approach</strong><br>
+      We still use the exact same CTR-like encryption + HMAC design from Version 1. The difference is mainly in how we store Argon2 parameters and how we handle the in-memory key.
+    </li>
+  </ol>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Detailed Explanation</h2>
+
+  <h3>1. File Layout</h3>
+  <p>In Version 2, an encrypted file looks like this:</p>
+  <pre><code>
+  0..4   = "TFSH" (ASCII magic bytes)
+  4..6   = version (u16), e.g. 0x0001 for "Version 2"
+  6..20  = Argon2 parameters (14 bytes total):
+           - memory cost (u32)
+           - passes (u32)
+           - lanes (u32)
+           (plus the 2-byte version above => total 16 bytes from offset 4..20)
+  20..36 = salt (16 bytes)
+  36..52 = nonce (16 bytes)
+  52..EOF-64 = ciphertext
+  EOF-64..EOF = HMAC tag (64 bytes)
+  </code></pre>
+  <p>
+    In our example below, we define a struct <code>Argon2ParamsOnDisk</code> that serializes 
+    14 bytes (not including the 2 for <code>version</code> which appear right after the magic). 
+    This approach ensures each file carries its Argon2 settings, so if we tweak memory cost 
+    or number of passes in the future, the file remains decryptable.
+  </p>
+
+  <h3>2. Argon2 Key Derivation</h3>
+  <p>
+    We still call <code>hash_password_into</code> to derive 128 bytes from <code>(password, salt)</code>. 
+    That 128-byte master key is split into two parts:
+  </p>
+  <ul>
+    <li>64 bytes for the Threefish key</li>
+    <li>64 bytes for the HMAC key</li>
+  </ul>
+  <p>
+    Thanks to Argon2, the key derivation is memory-hard, making brute-forcing 
+    the password more difficult for an attacker.
+  </p>
+
+  <h3>3. Threefish-512 in CTR Mode + HMAC-SHA512</h3>
+  <p>
+    For encryption, we:
+  </p>
+  <ol>
+    <li>Split plaintext into 64-byte chunks.</li>
+    <li>For each chunk, we encrypt an all-zero block with a <em>tweak</em> containing <code>(nonce, counter)</code> to produce a 64-byte keystream.</li>
+    <li>We XOR that keystream into the plaintext chunk, producing ciphertext.</li>
+    <li>After generating all ciphertext, we compute HMAC-SHA512 over <code>(nonce || ciphertext)</code> and append the 64-byte tag at the end.</li>
+  </ol>
+  <p>
+    For decryption, we verify the HMAC first. If valid, we reconstruct the same keystream blocks and XOR them to recover the plaintext.
+  </p>
+
+  <h3>4. Zeroizing Keys</h3>
+  <p>
+    Immediately after encryption or decryption finishes, we call <code>master_key.zeroize()</code>. 
+    This uses the <code>zeroize</code> crate to overwrite the 128-byte buffer in memory, minimizing the time the key stays in RAM.
+  </p>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Full Source Code (Version 2)</h2>
+
+  <p>
+    Below is a single, self-contained Rust file that demonstrates these Version 2 changes. 
+    <strong>Note:</strong> you must add 
+    <code>zeroize = "1.5"</code> (or similar version) to your <code>Cargo.toml</code> under 
+    <code>[dependencies]</code>, along with the other dependencies 
+    (<code>rpassword</code>, <code>rand</code>, <code>rand_core</code>, <code>argon2</code>, 
+    <code>hmac</code>, <code>sha2</code>, <code>hex</code>).
+  </p>
+
+<pre><code>use std::convert::TryInto;
+use std::fs::OpenOptions;
+use std::io::{Read, Write, Seek, SeekFrom};
+use std::env;
+
+use rand::Rng;
+use rand_core::OsRng;
+use rpassword::read_password;
+use zeroize::Zeroize;  // <-- Important for zeroing keys
+
+use argon2::{Argon2, Algorithm, Params, Version};
+use hmac::{Hmac, Mac};
+use sha2::Sha512;
+
+// HMAC alias
+type HmacSha512 = Hmac<Sha512>;
+
+// ================================
+// Argon2 Parameter Struct
+// ================================
+#[derive(Debug)]
+struct Argon2ParamsOnDisk {
+    version: u16,       // e.g. 1 => "Version 2"
+    mem_cost_kib: u32,  // memory cost in KiB
+    passes: u32,        // number of passes
+    lanes: u32,         // parallelism
+}
+
+impl Argon2ParamsOnDisk {
+    fn serialize(&self) -> Vec<u8> {
+        // We store: version(2 bytes) + mem_cost(4) + passes(4) + lanes(4) = 14 bytes AFTER version
+        // But for clarity, we often handle version separately. 
+        // We'll combine them so the code is simpler: 
+        // [version(2), mem_cost(4), passes(4), lanes(4)] => 14 bytes total from offset [2..16],
+        // plus the "version" itself at offset [0..2].
+        // We'll do it in one go:
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&self.mem_cost_kib.to_le_bytes());
+        out.extend_from_slice(&self.passes.to_le_bytes());
+        out.extend_from_slice(&self.lanes.to_le_bytes());
+        out
+    }
+
+    fn deserialize(input: &[u8]) -> Option<(Self, usize)> {
+        // parse [ version (2 bytes), mem_cost(4), passes(4), lanes(4) ] => 14 bytes total
+        // returns (Self, bytes_consumed)
+        if input.len() < 14 {
+            return None;
+        }
+        let version = u16::from_le_bytes(input[0..2].try_into().ok()?);
+        let mem_cost_kib = u32::from_le_bytes(input[2..6].try_into().ok()?);
+        let passes = u32::from_le_bytes(input[6..10].try_into().ok()?);
+        let lanes = u32::from_le_bytes(input[10..14].try_into().ok()?);
+
+        let s = Self {
+            version,
+            mem_cost_kib,
+            passes,
+            lanes,
+        };
+        Some((s, 14))
+    }
+
+    fn to_argon2(&self) -> Argon2<'static> {
+        let params = Params::new(
+            self.mem_cost_kib,
+            self.passes,
+            self.lanes,
+            Some(128)    // we want 128-byte output
+        ).expect("Invalid Argon2 params");
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+    }
+}
+
+// ================================
+// Threefish-512 Implementation
+// ================================
+struct Threefish512 {
+    key: [u64; 8],
+    tweak: [u64; 2],
+}
+
+/// Rotation constants for Threefish-512 (72 rounds).
+const ROTATION_CONSTANTS: [[u64; 4]; 8] = [
+    [46, 36, 19, 37],
+    [33, 27, 14, 42],
+    [17, 49, 36, 39],
+    [44,  9, 54, 56],
+    [39, 30, 34, 24],
+    [13, 50, 10, 17],
+    [25, 29, 39, 43],
+    [ 8, 35, 56, 22],
+];
+
+#[inline(always)]
+fn mix(a: u64, b: u64, r: u64) -> (u64, u64) {
+    let a_new = a.wrapping_add(b);
+    let b_new = b.rotate_left(r as u32) ^ a_new;
+    (a_new, b_new)
+}
+
+impl Threefish512 {
+    fn new(key: [u64; 8], tweak: [u64; 2]) -> Self {
+        Self { key, tweak }
+    }
+
+    fn encrypt_block(&self, block: &mut [u64; 8]) {
+        let mut v = *block;
+        let mut ks = [0u64; 9];
+        let mut t = [0u64; 3];
+
+        // Parity
+        let mut parity = 0u64;
+        for &k in &self.key {
+            parity ^= k;
+        }
+        ks[..8].copy_from_slice(&self.key);
+        ks[8] = parity;
+
+        t[0] = self.tweak[0];
+        t[1] = self.tweak[1];
+        t[2] = self.tweak[0] ^ self.tweak[1];
+
+        for round in 0..72 {
+            if round % 4 == 0 {
+                let s = round % 8;
+                v[0] = v[0].wrapping_add(ks[(s + 0) % 9]);
+                v[1] = v[1].wrapping_add(ks[(s + 1) % 9]);
+                v[2] = v[2].wrapping_add(ks[(s + 2) % 9]);
+                v[3] = v[3].wrapping_add(ks[(s + 3) % 9]);
+                v[4] = v[4].wrapping_add(ks[(s + 4) % 9]);
+                v[5] = v[5]
+                    .wrapping_add(ks[(s + 5) % 9])
+                    .wrapping_add(t[(round / 4) % 3]);
+                v[6] = v[6]
+                    .wrapping_add(ks[(s + 6) % 9])
+                    .wrapping_add(t[((round / 4) + 1) % 3]);
+                v[7] = v[7].wrapping_add(ks[(s + 7) % 9]).wrapping_add(round as u64);
+            }
+
+            let rc = ROTATION_CONSTANTS[round as usize % 8];
+            let (n0, n1) = mix(v[0], v[1], rc[0]);
+            v[0] = n0;
+            v[1] = n1;
+            let (n2, n3) = mix(v[2], v[3], rc[1]);
+            v[2] = n2;
+            v[3] = n3;
+            let (n4, n5) = mix(v[4], v[5], rc[2]);
+            v[4] = n4;
+            v[5] = n5;
+            let (n6, n7) = mix(v[6], v[7], rc[3]);
+            v[6] = n6;
+            v[7] = n7;
+
+            // Permutation
+            v = [
+                v[0], v[3], v[2], v[1],
+                v[4], v[7], v[6], v[5],
+            ];
+        }
+
+        // Final key injection
+        let s = 72 % 8; // = 0
+        v[0] = v[0].wrapping_add(ks[(s + 0) % 9]);
+        v[1] = v[1].wrapping_add(ks[(s + 1) % 9]);
+        v[2] = v[2].wrapping_add(ks[(s + 2) % 9]);
+        v[3] = v[3].wrapping_add(ks[(s + 3) % 9]);
+        v[4] = v[4].wrapping_add(ks[(s + 4) % 9]);
+        v[5] = v[5]
+            .wrapping_add(ks[(s + 5) % 9])
+            .wrapping_add(t[(72 / 4) % 3]);
+        v[6] = v[6]
+            .wrapping_add(ks[(s + 6) % 9])
+            .wrapping_add(t[((72 / 4) + 1) % 3]);
+        v[7] = v[7].wrapping_add(ks[(s + 7) % 9]).wrapping_add(72);
+
+        *block = v;
+    }
+}
+
+// ================================
+// Utility for CTR-like encryption
+// ================================
+fn build_tweak(nonce: &[u8; 16], counter: u64) -> [u64; 2] {
+    let mut t = [0u64; 2];
+    t[0] = u64::from_le_bytes(nonce[0..8].try_into().unwrap());
+    let mut second = u64::from_le_bytes(nonce[8..16].try_into().unwrap());
+    second ^= counter;
+    t[1] = second;
+    t
+}
+
+fn threefish_ctr_xor_block(key: &[u64; 8], tweak: &[u64; 2], input_block: &mut [u8]) {
+    // 1) Encrypt an all-zero block with (key, tweak)
+    let mut zero_block = [0u64; 8];
+    let tf = Threefish512::new(*key, *tweak);
+    tf.encrypt_block(&mut zero_block);
+
+    // 2) XOR the resulting 64-byte keystream into input_block
+    let keystream_bytes = zero_block
+        .iter()
+        .flat_map(|&word| word.to_le_bytes())
+        .collect::<Vec<u8>>();
+    for (i, b) in input_block.iter_mut().enumerate() {
+        *b ^= keystream_bytes[i];
+    }
+}
+
+// ================================
+// Encryption + HMAC
+// ================================
+fn encrypt_data(
+    master_key: &[u8; 128],
+    nonce: &[u8; 16],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    let (tf_key_bytes, hmac_key) = master_key.split_at(64);
+
+    // Convert 64 bytes -> [u64; 8]
+    let mut tf_key = [0u64; 8];
+    for (i, chunk) in tf_key_bytes.chunks(8).enumerate() {
+        tf_key[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+
+    // CTR encryption
+    let mut ciphertext = plaintext.to_vec();
+    let block_size = 64;
+    let mut counter = 0u64;
+    let mut offset = 0;
+    while offset < ciphertext.len() {
+        let end = offset + block_size.min(ciphertext.len() - offset);
+        let tweak = build_tweak(nonce, counter);
+        threefish_ctr_xor_block(&tf_key, &tweak, &mut ciphertext[offset..end]);
+        offset = end;
+        counter = counter.wrapping_add(1);
+    }
+
+    // HMAC over (nonce || ciphertext)
+    let mut mac = HmacSha512::new_from_slice(hmac_key).expect("HMAC key error");
+    mac.update(nonce);
+    mac.update(&ciphertext);
+    let tag = mac.finalize().into_bytes(); // 64 bytes
+
+    // Combine ciphertext + tag
+    let mut out = Vec::with_capacity(ciphertext.len() + 64);
+    out.extend_from_slice(&ciphertext);
+    out.extend_from_slice(&tag);
+    out
+}
+
+fn decrypt_data(
+    master_key: &[u8; 128],
+    nonce: &[u8; 16],
+    ciphertext_and_tag: &[u8],
+) -> Result<Vec<u8>, String> {
+    if ciphertext_and_tag.len() < 64 {
+        return Err("Ciphertext too short".to_string());
+    }
+    let (ciphertext, tag) = ciphertext_and_tag.split_at(ciphertext_and_tag.len() - 64);
+
+    let (tf_key_bytes, hmac_key) = master_key.split_at(64);
+
+    // Convert 64 bytes -> [u64; 8]
+    let mut tf_key = [0u64; 8];
+    for (i, chunk) in tf_key_bytes.chunks(8).enumerate() {
+        tf_key[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+
+    // Verify HMAC
+    let mut mac = HmacSha512::new_from_slice(hmac_key)
+        .map_err(|_| "Invalid HMAC key".to_string())?;
+    mac.update(nonce);
+    mac.update(ciphertext);
+    mac.verify_slice(tag).map_err(|_| "HMAC mismatch".to_string())?;
+
+    // Decrypt
+    let mut plaintext = ciphertext.to_vec();
+    let block_size = 64;
+    let mut counter = 0u64;
+    let mut offset = 0;
+    while offset < plaintext.len() {
+        let end = offset + block_size.min(plaintext.len() - offset);
+        let tweak = build_tweak(nonce, counter);
+        threefish_ctr_xor_block(&tf_key, &tweak, &mut plaintext[offset..end]);
+        offset = end;
+        counter = counter.wrapping_add(1);
+    }
+
+    Ok(plaintext)
+}
+
+// ================================
+// Key Derivation (Argon2) Utility
+// ================================
+fn derive_key_128(password: &str, salt: &[u8], argon2: &Argon2) -> [u8; 128] {
+    let mut out = [0u8; 128];
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut out)
+        .expect("Argon2 hashing failed");
+    out
+}
+
+// ================================
+// Main CLI Logic
+// ================================
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <filename>", args[0]);
+        std::process::exit(1);
+    }
+    let filename = &args[1];
+
+    print!("Enter password: ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let pass1 = read_password()?;
+
+    print!("Repeat password: ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let pass2 = read_password()?;
+    if pass1 != pass2 {
+        eprintln!("Passwords do not match!");
+        std::process::exit(1);
+    }
+
+    let mut file = OpenOptions::new().read(true).write(true).open(filename)?;
+
+    // We'll read an initial chunk to see if we have "TFSH"
+    let mut header = [0u8; 32];
+    let n = file.read(&mut header)?;
+    file.seek(SeekFrom::Start(0))?;
+
+    const MAGIC: &[u8] = b"TFSH";
+    if n >= 4 && &header[0..4] == MAGIC {
+        // Decryption branch
+        // 1) Read Argon2ParamsOnDisk (version + memory cost, etc.)
+        let maybe_params = Argon2ParamsOnDisk::deserialize(&header[4..]);
+        if maybe_params.is_none() {
+            eprintln!("Invalid or incomplete Argon2 parameter header.");
+            std::process::exit(1);
+        }
+        let (a2params, consumed) = maybe_params.unwrap();
+        let offset_after_params = 4 + consumed; // (4 = length of "TFSH")
+
+        // 2) Next 16 bytes = salt, next 16 bytes = nonce
+        let salt_offset = offset_after_params;
+        let nonce_offset = salt_offset + 16;
+        let total_header_len = nonce_offset + 16; // end of salt+nonce
+
+        if n < total_header_len {
+            // We need to read more header bytes
+            let mut more = vec![0u8; total_header_len - n];
+            file.read_exact(&mut more)?;
+            // Merge them with the original 'header'
+            let mut combined = Vec::from(&header[..n]);
+            combined.extend_from_slice(&more);
+            header[..total_header_len].copy_from_slice(&combined[..total_header_len]);
+        }
+
+        let salt = &header[salt_offset..salt_offset+16];
+        let nonce = &header[nonce_offset..nonce_offset+16];
+
+        // 3) Now read the rest (ciphertext+tag)
+        file.seek(SeekFrom::Start(total_header_len as u64))?;
+        let mut file_data = Vec::new();
+        file.read_to_end(&mut file_data)?;
+
+        // 4) Build Argon2 from disk parameters, derive key
+        let argon2 = a2params.to_argon2();
+        let mut master_key = derive_key_128(&pass1, salt, &argon2);
+
+        // 5) Decrypt
+        match decrypt_data(&master_key, nonce.try_into().unwrap(), &file_data) {
+            Ok(plaintext) => {
+                // Overwrite file
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                file.write_all(&plaintext)?;
+
+                master_key.zeroize();
+            }
+            Err(e) => {
+                eprintln!("Decryption error: {e}");
+                master_key.zeroize();
+                std::process::exit(1);
+            }
+        }
+
+    } else {
+        // Encryption branch
+        // We'll define Argon2 params
+        let a2params_disk = Argon2ParamsOnDisk {
+            version: 1,        // "Version 2"
+            mem_cost_kib: 65536, // e.g. 64 MB
+            passes: 3,
+            lanes: 4,
+        };
+        let argon2 = a2params_disk.to_argon2();
+
+        // Generate salt+nonce
+        let mut salt = [0u8; 16];
+        let mut nonce = [0u8; 16];
+        OsRng.fill(&mut salt);
+        OsRng.fill(&mut nonce);
+
+        // Derive the master key
+        let mut master_key = derive_key_128(&pass1, &salt, &argon2);
+
+        // Read plaintext
+        let mut plaintext = Vec::new();
+        file.read_to_end(&mut plaintext)?;
+
+        // Encrypt
+        let ciphertext_tag = encrypt_data(&master_key, &nonce, &plaintext);
+
+        // Overwrite file with versioned header
+        file.seek(SeekFrom::Start(0))?;
+        file.set_len(0)?;
+
+        // Write "TFSH"
+        file.write_all(MAGIC)?;
+
+        // Write Argon2 params
+        let param_bytes = a2params_disk.serialize();
+        file.write_all(&param_bytes)?;
+
+        // Write salt + nonce
+        file.write_all(&salt)?;
+        file.write_all(&nonce)?;
+
+        // Write ciphertext + tag
+        file.write_all(&ciphertext_tag)?;
+
+        master_key.zeroize();
+    }
+
+    Ok(())
+}
+</code></pre>
+
+  <p>
+    <strong>Important:</strong> 
+    <ul>
+      <li>Ensure your <code>Cargo.toml</code> has <code>zeroize = "1.5"</code> (or a compatible version) along with <code>rpassword</code>, <code>rand</code>, <code>rand_core</code>, <code>argon2</code>, <code>hmac</code>, <code>sha2</code>, and <code>hex</code>.</li>
+      <li>When you run <code>cargo run -- &lt;filename&gt;</code>, the app will check if &lt;filename&gt; starts with <code>"TFSH"</code>. If it does, it attempts decryption; otherwise, it encrypts.</li>
+      <li>If encrypting, it writes the new “Version 2” layout with Argon2 parameters, salt, nonce, ciphertext, and HMAC all in a single file.</li>
+    </ul>
+  </p>
+
+</div>
+
+<div class="section">
+  <h2>Conclusion &amp; Next Steps</h2>
+  <p>
+    Version 2 of this Threefish-512 CLI app improves on Version 1 by:
+  </p>
+  <ul>
+    <li>Embedding Argon2 parameters for forward compatibility</li>
+    <li>Versioning the header for simpler upgrades</li>
+    <li>Zeroizing the in-memory key to reduce forensic risk</li>
+  </ul>
+
+  <p>
+    This tool remains a demonstration of <em>manually combining a block cipher in CTR mode with a separate HMAC</em> for authentication. For production scenarios, you might consider standardized AEAD ciphers (AES-GCM, ChaCha20-Poly1305), or ensure your Threefish code is thoroughly audited. 
+  </p>
+
+  <p>
+    Nevertheless, this version should compile and function as a standalone Rust command-line program for learning or experimentation with the Threefish-512 cipher.
+  </p>
+</div>
+
+</body>
+</html>
+
